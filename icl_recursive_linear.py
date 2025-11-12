@@ -1,7 +1,8 @@
-# icl_recursive_linear.py
 import os, math, statistics, random
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import Sequence, List, Tuple, Dict, Any
 from together import Together
 
 # ---------- Config ----------
@@ -44,37 +45,6 @@ def build_messages(context_pairs: List[Pair], query_x: float) -> List[Dict[str, 
         {"role": "user", "content": user},
     ]
 
-## --- formatting helpers (drop-in) ---
-
-# def format_pair(p: Pair) -> str:
-#     # Stable, one-liner representation; no spaces around separator to reduce drift.
-#     # Use compact float formatting so numbers don't grow unnecessarily.
-#     return f"{p.x:.12g}->{p.y:.12g}"
-
-# def build_messages(context_pairs: list[Pair], query_x: float) -> list[dict]:
-#     # Single-line context using a pipe as a hard separator.
-#     ctx_line = " | ".join(format_pair(p) for p in context_pairs)
-
-#     user = (
-#         "CONTEXT: " + ctx_line + "\n"
-#         f"QUERY: {query_x:.12g}\n"
-#         # "TASK: Infer y so that 'x->y' matches the pattern implied by CONTEXT.\n"
-#         # "ANSWER: Return STRICT JSON per schema (no extra text)."
-#     )
-
-#     return [
-#         {"role": "system", "content":
-#             "You are an ICL assistant. You will see two lines:\n"
-#             " - 'CONTEXT:' with a single line of items like 'x->y' separated by ' | '\n"
-#             " - 'QUERY:' with a single numeric x.\n"
-#             "Use ONLY the 'QUERY:' line as the question. "
-#             "Ignore any other numbers not in 'QUERY:'. "
-#             "Return STRICT JSON per the provided schema (no extra text). "
-#             "If rounding is needed, round to 6 decimals."
-#         },
-#         {"role": "user", "content": user},
-#     ]
-
 # ---------- Structured output (JSON schema) ----------
 # Together’s chat.completions supports response_format with json_schema for compliant JSON.
 # We keep it minimal: a single number y_hat.
@@ -96,7 +66,7 @@ RESPONSE_FORMAT = {
 
 def ask_model_numeric(context_pairs: List[Pair], x_query: float) -> float:
     messages = build_messages(context_pairs, x_query)
-    print("Asking model with context:\n", messages)
+    # print("Asking model with context:\n", messages)
     resp = client.chat.completions.create(
         model=MODEL,
         messages=messages,
@@ -152,40 +122,186 @@ def gen_linear_pairs(a: float, b: float, xs: List[float], noise_std: float = 0.0
         out.append(Pair(x, y))
     return out
 
+# Additional utilities for weighted sampling without replacement and replicates
+
+def weighted_sample_without_replacement(
+    population: Sequence[Any],
+    probs: Sequence[float],
+    k: int,
+    rng: np.random.Generator,
+) -> List[Any]:
+    """
+    Sample k items from `population` without replacement using weights `probs`.
+    Uses numpy's choice with replace=False.
+    """
+    probs = np.array(probs, dtype=float)
+    if probs.shape[0] != len(population):
+        raise ValueError("probs and population must have the same length")
+    if np.any(probs < 0):
+        raise ValueError("probs must be nonnegative")
+    s = probs.sum()
+    if s <= 0:
+        raise ValueError("sum(probs) must be > 0")
+    p = probs / s
+    idx = rng.choice(len(population), size=k, replace=False, p=p)
+    return [population[i] for i in idx]
+
+def run_single_replicate(
+    context: List[Pair],          # full candidate labeled pool to sample from
+    partial_x: List[float],              # N unlabeled x's to roll out sequentially
+    validation: List[Pair],              # validation labeled pairs
+) -> Dict[str, Any]:
+    """
+    One full replicate:
+      - sample M labeled seeds (without replacement, weighted by probs)
+      - N sequential rollouts on partial_x, appending each (x, y_hat) to the context
+      - predict on validation
+      - return per-point squared errors and overall MSE
+    """
+    # rng = np.random.default_rng(rng_seed)
+    # full_context_seed = weighted_sample_without_replacement(
+    #     data_all_pairs, probs, M, rng
+    # )
+
+    res = recursive_rollout_and_validate(
+        full_context=context,
+        partial_context_x=partial_x,
+        validation=validation,
+    )
+
+    # Per-point squared errors for this replicate
+    se = [(yt - yp) ** 2 for yt, yp in zip(res["y_true"], res["y_pred"])]
+    return {
+        "mse": float(res["mse"]),
+        "se_per_val": se,          # list aligned with validation order
+        "y_pred": res["y_pred"],   # optional: keep predictions if you want later analyses
+        "context": res["final_context"],
+        "context_size": res["final_context_size"],
+    }
+
+def aggregate_replicates(
+    results: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Aggregate across B replicates:
+      - overall MSE mean & variance
+      - per-validation-point SE mean & variance
+    """
+    B = len(results)
+    mses = np.array([r["mse"] for r in results], dtype=float)
+
+    # Stack per-point SEs to shape (B, V) where V = len(validation)
+    se_context = [[s.y for s in r["context"]] for r in results]
+    se_context.insert(0, [p.x for p in results[0]["context"]])  # header for easier reading
+    se_matrix = np.stack([np.array(r["se_per_val"], dtype=float) for r in results], axis=0)
+    se_mean = se_matrix.mean(axis=0)
+    se_var  = se_matrix.var(axis=0, ddof=1) if B > 1 else np.zeros_like(se_mean)
+
+    summary = {
+        "B": B,
+        "contexts": se_context,
+        "mse_mean": float(mses.mean()),
+        "mse_var": float(mses.var(ddof=1) if B > 1 else 0.0),
+        "per_val_se_mean": se_mean.tolist(),
+        "per_val_se_var": se_var.tolist(),
+    }
+    return summary
+
+def run_b_replicates_parallel(
+    B: int,
+    data_all_pairs: List[Pair],
+    M: int,
+    probs: Sequence[float],
+    partial_x: List[float],
+    validation: List[Pair],
+    rng_seed: int = 123,             # replicate-specific seed
+    max_workers: int = 4     # tune based on your rate limit & machine
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Launch B independent replicates in parallel threads (I/O-bound).
+    Each replicate still performs N rollouts sequentially (context grows),
+    but replicates run concurrently.
+    """
+    jobs = []
+    results: List[Dict[str, Any]] = []
+    
+    rng = np.random.default_rng(rng_seed)
+    context = weighted_sample_without_replacement(
+        data_all_pairs, probs, M, rng
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for b in range(B):
+            fut = ex.submit(
+                run_single_replicate,
+                context, partial_x, validation
+            )
+            jobs.append(fut)
+        for fut in as_completed(jobs):
+            results.append(fut.result())
+
+    summary = aggregate_replicates(results)
+    return results, summary
+
 if __name__ == "__main__":
     random.seed(7)
+    np.random.seed(7)
 
-    # ----- Noiseless linear function: y = 2 + 3x -----
+    # ----- Linear function: y = 2 + 3x -----
     a, b = 2.0, 3.0
 
-    # Full dataset to sample from (you can replace by your own)
-    xs_all = [0, 0.20, 0.5, 1, 1.3, 1.5, 2, 2.5, 3, 3.2, 3.5, 4, 4.5, 5.5]
+    xs_all    = [0, 0.25, 0.75, 1.25, 2, 2.5, 3, 3.5, 4.25, 4.5, 5, 5.5, 6.75]
+    probs_all = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    # xs_all    = [0, 0.20, 0.5, 1, 1.3, 1.5, 2, 2.5, 3, 3.2, 3.5, 4, 4.5, 5, 5.5]
+    # probs_all = [1, 2, 1, 1, 1, 1, 1.5, 1, 1, 1, 1, 2, 2, 1.5]  
+
+    # Build labeled pool (noiseless)
     data_all = gen_linear_pairs(a, b, xs_all, noise_std=0.0)
 
-    # Choose M seed context, N partials, and a validation set
-    M = 14
-    N = 6
-    full_context_seed = data_all[:M]              # [(0,2), (0.5,3.5), (1,5)]
-    partial_x = [0.25, 1.75, 3.75, 2.25, 4.75, 5.25][:N]                    # unlabeled at first
-    validation = gen_linear_pairs(a, b, [3.1, 1.2, 5.75], noise_std=0.0)
+    # N rollouts and validation set
+    M = 12               # choose M <= len(xs_all)
+    N = 12
+    partial_x = [0.5, 1.5, 1.75, 2.25, 2.75, 3.25, 3.75, 4, 4.75, 5.25, 6, 6.25][:N]
+    validation = gen_linear_pairs(a, b, [1, 5.75, 6.5], noise_std=0.0)
 
-    print("=== NOISELESS ===")
-    res_clean = recursive_rollout_and_validate(full_context_seed, partial_x, validation)
-    print("MSE:", res_clean["mse"])
-    print("y_true:", res_clean["y_true"])
-    print("y_pred:", res_clean["y_pred"])
-    print("final_context_size:", res_clean["final_context_size"])
+    # Replicates
+    B = 20
+    max_workers = 10   # be mindful of API rate limits
+
+    print("=== NOISELESS: B replicates of sequential rollouts ===")
+    res_list_clean, summary_clean = run_b_replicates_parallel(
+        B=B,
+        data_all_pairs=data_all,
+        M=M,
+        probs=probs_all,
+        partial_x=partial_x,
+        validation=validation,
+        rng_seed=123,
+        max_workers=max_workers,
+    )
+    print("Overall MSE mean:", summary_clean["mse_mean"])
+    print("Overall MSE var :", summary_clean["mse_var"])
+    print("Per-val SE mean :", summary_clean["per_val_se_mean"])
+    print("Per-val SE var  :", summary_clean["per_val_se_var"])
+    print("Context examples:", summary_clean["contexts"])  # print replicate's final context
 
     # ----- Noisy linear function: y = 2 + 3x + ε, ε ~ N(0, 0.2^2) -----
     noise_std = 0.2
     data_all_noisy = gen_linear_pairs(a, b, xs_all, noise_std=noise_std)
-    full_context_seed_noisy = data_all_noisy[:M]
-    # Use different partials if you wish; reuse here
-    validation_noisy = gen_linear_pairs(a, b, [3.1, 1.2, 5.75], noise_std=noise_std)
+    validation_noisy = gen_linear_pairs(a, b, [-0.25, 1, 5.75, 6.5], noise_std=noise_std)
 
-    print("\n=== NOISY ===")
-    res_noisy = recursive_rollout_and_validate(full_context_seed_noisy, partial_x, validation_noisy)
-    print("MSE:", res_noisy["mse"])
-    print("y_true:", res_noisy["y_true"])
-    print("y_pred:", res_noisy["y_pred"])
-    print("final_context_size:", res_noisy["final_context_size"])
+    print("\n=== NOISY: B replicates of sequential rollouts ===")
+    res_list_noisy, summary_noisy = run_b_replicates_parallel(
+        B=B,
+        data_all_pairs=data_all_noisy,
+        M=M,
+        probs=probs_all,
+        partial_x=partial_x,
+        validation=validation_noisy,
+        rng_seed=123,
+        max_workers=max_workers,
+    )
+    print("Overall MSE mean:", summary_noisy["mse_mean"])
+    print("Overall MSE var :", summary_noisy["mse_var"])
+    print("Per-val SE mean :", summary_noisy["per_val_se_mean"])
+    print("Per-val SE var  :", summary_noisy["per_val_se_var"])
