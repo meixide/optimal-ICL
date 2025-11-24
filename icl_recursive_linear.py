@@ -6,7 +6,7 @@ from typing import Sequence, List, Tuple, Dict, Any
 from together import Together
 
 # ---------- Config ----------
-MODEL = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free"  # free reasoning model on Together
+MODEL = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"  # free reasoning model on Together
 TEMPERATURE = 0.2
 MAX_TOKENS = 200
 
@@ -250,8 +250,8 @@ if __name__ == "__main__":
     # ----- Linear function: y = 2 + 3x -----
     a, b = 2.0, 3.0
 
-    xs_all    = [0, 0.25, 0.75, 1.25, 2, 2.5, 3, 3.5, 4.25, 4.5, 5, 5.5, 6.75]
-    probs_all = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    xs_all    = [0, 0.25, 0.75, 1.25, 2, 2.5, 3, 3.5, 4.25, 4.5, 5, 5.5, 6.75, 1, 5.75]
+    probs_all = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
     # xs_all    = [0, 0.20, 0.5, 1, 1.3, 1.5, 2, 2.5, 3, 3.2, 3.5, 4, 4.5, 5, 5.5]
     # probs_all = [1, 2, 1, 1, 1, 1, 1.5, 1, 1, 1, 1, 2, 2, 1.5]  
 
@@ -259,9 +259,9 @@ if __name__ == "__main__":
     data_all = gen_linear_pairs(a, b, xs_all, noise_std=0.0)
 
     # N rollouts and validation set
-    M = 12               # choose M <= len(xs_all)
-    N = 12
-    partial_x = [0.5, 1.5, 1.75, 2.25, 2.75, 3.25, 3.75, 4, 4.75, 5.25, 6, 6.25][:N]
+    M = 14               # choose M <= len(xs_all)
+    N = 15               # number of sequential rollouts
+    partial_x = [0.5, 1, 1.5, 1.75, 2.25, 2.75, 3.25, 3.75, 4, 4.75, 5.25, 5.75, 6, 6.25, 6.5][:N]
     validation = gen_linear_pairs(a, b, [1, 5.75, 6.5], noise_std=0.0)
 
     # Replicates
@@ -288,7 +288,7 @@ if __name__ == "__main__":
     # ----- Noisy linear function: y = 2 + 3x + ε, ε ~ N(0, 0.2^2) -----
     noise_std = 0.2
     data_all_noisy = gen_linear_pairs(a, b, xs_all, noise_std=noise_std)
-    validation_noisy = gen_linear_pairs(a, b, [-0.25, 1, 5.75, 6.5], noise_std=noise_std)
+    validation_noisy = gen_linear_pairs(a, b, [1, 5.75, 6.5], noise_std=noise_std)
 
     print("\n=== NOISY: B replicates of sequential rollouts ===")
     res_list_noisy, summary_noisy = run_b_replicates_parallel(
